@@ -8,6 +8,7 @@ import numpy as np
 
 # Step 1 - feature_planes
 import torch
+import math
 
 def feature_planes(game, value=False):
     """
