@@ -173,3 +173,81 @@ def feature_planes(game, value=False):
 
     return planes
 
+# Step 2 - symmetries
+def symmetries(planes, move):
+    """
+    Generate all 8 rotations and reflections of a Go training example.
+
+    Args:
+        planes: Tensor of shape (C, n, n).
+        move: Integer representing a point as row * n + col.
+
+    Returns:
+        xs: Tensor of shape (8, C, n, n), containing the transformed
+            feature planes. Index 0 is the original example.
+        moves: int64 tensor of shape (8,), containing the corresponding
+               transformed move positions.
+    """
+
+    n = planes.shape[-1]
+
+    # Convert the flattened move index into row and column coordinates.
+    row, col = divmod(int(move), n)
+
+    # Create a one-hot board marking the original move position.
+    # Using the same device and dtype as the feature planes ensures
+    # compatibility with CPU and GPU tensors.
+    move_mask = torch.zeros(
+        (n, n),
+        dtype=planes.dtype,
+        device=planes.device
+    )
+    move_mask[row, col] = 1.0
+
+    transformed_planes = []
+    transformed_moves = []
+
+    # Generate four rotations and their four horizontal reflections.
+    for j in range(8):
+
+        # Apply j % 4 counterclockwise quarter-turn rotations.
+        rotated_planes = torch.rot90(
+            planes,
+            k=j % 4,
+            dims=(-2, -1)
+        )
+
+        rotated_move = torch.rot90(
+            move_mask,
+            k=j % 4,
+            dims=(-2, -1)
+        )
+
+        # For indices 4-7, additionally reflect the board
+        # from left to right.
+        if j >= 4:
+            rotated_planes = torch.flip(
+                rotated_planes,
+                dims=(-1,)
+            )
+
+            rotated_move = torch.flip(
+                rotated_move,
+                dims=(-1,)
+            )
+
+        # Store the transformed feature planes.
+        transformed_planes.append(rotated_planes)
+
+        # Find the flattened position of the transformed move.
+        # argmax returns its index as a torch.int64 scalar.
+        new_move = torch.argmax(rotated_move.reshape(-1))
+
+        transformed_moves.append(new_move)
+
+    # Stack all eight transformations along a new leading dimension.
+    xs = torch.stack(transformed_planes, dim=0)
+    moves = torch.stack(transformed_moves).to(torch.int64)
+
+    return xs, moves
+

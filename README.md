@@ -11,6 +11,7 @@ python scaffold.py
 ## Steps
 
 - [x] **1.** feature_planes
+- [x] **2.** symmetries
 
 ---
 
