@@ -371,3 +371,97 @@ def expert_positions(records, n=5, komi=0.5):
 
     return x, legal, moves, z, game_ids
 
+# Step 4 - PolicyNet
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class PolicyNet(nn.Module):
+    """
+    AlphaGo Supervised Learning Policy Network.
+
+    Architecture:
+        - Initial 5x5 convolution.
+        - (layers - 2) intermediate 3x3 convolutions.
+        - Final 1x1 convolution without bias.
+        - Learnable position-specific bias.
+        - Log-softmax over legal board positions.
+    """
+
+    def __init__(self, planes=46, k=32, layers=5, n=5):
+        super().__init__()
+
+        self.n = n
+
+        # Store the convolutional layers.
+        self.convs = nn.ModuleList()
+
+        # First convolution: input feature planes -> k channels.
+        self.convs.append(
+            nn.Conv2d(
+                in_channels=planes,
+                out_channels=k,
+                kernel_size=5,
+                padding=2
+            )
+        )
+
+        # Intermediate 3x3 convolutional layers.
+        # Each layer preserves the spatial dimensions of the board.
+        for _ in range(layers - 2):
+            self.convs.append(
+                nn.Conv2d(
+                    in_channels=k,
+                    out_channels=k,
+                    kernel_size=3,
+                    padding=1
+                )
+            )
+
+        # Final 1x1 convolution produces one logit per board position.
+        # Bias is disabled because a separate position-specific bias
+        # is added after flattening.
+        self.head = nn.Conv2d(
+            in_channels=k,
+            out_channels=1,
+            kernel_size=1,
+            bias=False
+        )
+
+        # Independent learnable bias for each board intersection.
+        self.position_bias = nn.Parameter(
+            torch.zeros(n * n)
+        )
+
+    def forward(self, x, legal):
+        """
+        Compute log-probabilities for all board positions.
+
+        Args:
+            x: Feature tensor of shape (B, planes, n, n).
+            legal: Boolean legal-move mask of shape (B, n*n).
+
+        Returns:
+            Log-probabilities of shape (B, n*n).
+            Illegal positions receive -inf.
+        """
+
+        # Apply convolutional layers with ReLU activations.
+        for conv in self.convs:
+            x = F.relu(conv(x))
+
+        # Produce one score for every board intersection.
+        x = self.head(x)
+
+        # Flatten spatial dimensions into (B, n*n).
+        logits = x.flatten(start_dim=1)
+
+        # Add the learnable position-specific biases.
+        logits = logits + self.position_bias
+
+        # Exclude illegal moves from the policy distribution.
+        logits = logits.masked_fill(~legal, float("-inf"))
+
+        # Normalize over legal moves using log-softmax.
+        return torch.log_softmax(logits, dim=1)
+

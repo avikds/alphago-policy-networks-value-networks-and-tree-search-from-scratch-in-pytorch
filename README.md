@@ -13,6 +13,7 @@ python scaffold.py
 - [x] **1.** feature_planes
 - [x] **2.** symmetries
 - [x] **3.** expert_positions
+- [x] **4.** PolicyNet
 
 ---
 
