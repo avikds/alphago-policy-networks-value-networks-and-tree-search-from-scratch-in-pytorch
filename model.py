@@ -507,3 +507,255 @@ def sl_step(net, optimizer, x, legal, moves):
 
     return float(loss_value)
 
+# Step 6 - RolloutPolicy
+class RolloutPolicy:
+    """
+    AlphaGo fast rollout policy.
+
+    Linear softmax model using:
+        1. Save-atari features.
+        2. Neighbour features relative to the last move.
+        3. Local 3x3 pattern features.
+    """
+
+    def __init__(self):
+        self.index = {}
+        self.w = []
+
+    @staticmethod
+    def _count(items):
+        """Count elements or convert a scalar count to an integer."""
+        if items is None:
+            return 0
+
+        try:
+            return len(items)
+        except TypeError:
+            return int(items)
+
+    def features(self, game, p):
+        """
+        Extract active binary features for a candidate move.
+
+        Pattern encoding:
+            0 = Outside the board
+            1 = Empty point
+            1 + L = Friendly stone
+            4 + L = Opponent stone
+
+        L is capped at 3.
+        """
+
+        n = game.n
+        player = game.to_play
+        opponent = 3 - player
+
+        row, col = divmod(p, n)
+
+        feature_keys = []
+
+        # --------------------------------------------------
+        # 1. Save-atari feature
+        # --------------------------------------------------
+
+        orthogonal = (
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1)
+        )
+
+        legal, captured, size, liberties_after = game.move_info(p)
+
+        if legal and self._count(liberties_after) >= 2:
+
+            for dr, dc in orthogonal:
+                nr = row + dr
+                nc = col + dc
+
+                if not (0 <= nr < n and 0 <= nc < n):
+                    continue
+
+                q = nr * n + nc
+
+                if game.board[q] != player:
+                    continue
+
+                stones, liberties = game.chain(q)
+
+                if self._count(liberties) == 1:
+                    feature_keys.append(("save_atari",))
+                    break
+
+        # --------------------------------------------------
+        # 2. Neighbour-of-last-move feature
+        # --------------------------------------------------
+
+        last_move = game.last_move
+        pass_move = game.pass_move
+
+        if last_move is not None and last_move != pass_move:
+
+            last_row, last_col = divmod(last_move, n)
+
+            dr = row - last_row
+            dc = col - last_col
+
+            if max(abs(dr), abs(dc)) == 1:
+                feature_keys.append(("neighbour", dr, dc))
+
+        # --------------------------------------------------
+        # 3. Local 3x3 pattern feature
+        # --------------------------------------------------
+
+        offsets = (
+            (-1, -1),
+            (-1, 0),
+            (-1, 1),
+            (0, -1),
+            (0, 1),
+            (1, -1),
+            (1, 0),
+            (1, 1)
+        )
+
+        pattern = []
+
+        for dr, dc in offsets:
+
+            nr = row + dr
+            nc = col + dc
+
+            # Outside the board.
+            if not (0 <= nr < n and 0 <= nc < n):
+                pattern.append(0)
+                continue
+
+            q = nr * n + nc
+            stone = game.board[q]
+
+            if stone == 0:
+
+                # Empty intersection.
+                pattern.append(1)
+
+            elif stone == player:
+
+                # Friendly stone: 1 + capped liberty count.
+                stones, liberties = game.chain(q)
+
+                L = min(self._count(liberties), 3)
+
+                pattern.append(1 + L)
+
+            elif stone == opponent:
+
+                # Opponent stone: 4 + capped liberty count.
+                stones, liberties = game.chain(q)
+
+                L = min(self._count(liberties), 3)
+
+                pattern.append(4 + L)
+
+        # The pattern feature is always included.
+        feature_keys.append(("pattern", *pattern))
+
+        return feature_keys
+
+    def probs(self, game, moves):
+        """
+        Calculate softmax probabilities over candidate moves.
+        Unknown feature keys contribute zero to the score.
+        """
+
+        if not moves:
+            return []
+
+        scores = []
+
+        for p in moves:
+
+            score = sum(
+                self.w[self.index[key]]
+                for key in self.features(game, p)
+                if key in self.index
+            )
+
+            scores.append(score)
+
+        # Numerically stable softmax.
+        max_score = max(scores)
+
+        exp_scores = [
+            math.exp(score - max_score)
+            for score in scores
+        ]
+
+        total = sum(exp_scores)
+
+        return [
+            score / total
+            for score in exp_scores
+        ]
+
+    def train_step(self, game, move, moves, lr):
+        """
+        Perform one gradient-ascent step on log P(move).
+
+        Previously unseen feature keys are initialized to zero.
+        """
+
+        moves = list(moves)
+
+        # Register all features before computing probabilities.
+        for p in moves:
+
+            for key in self.features(game, p):
+
+                if key not in self.index:
+                    self.index[key] = len(self.w)
+                    self.w.append(0.0)
+
+        # Calculate current candidate probabilities.
+        probabilities = self.probs(game, moves)
+
+        # Gradient ascent on the expert move's log-probability.
+        for p, probability in zip(moves, probabilities):
+
+            gradient = lr * (
+                (1.0 if p == move else 0.0) - probability
+            )
+
+            for key in self.features(game, p):
+
+                idx = self.index[key]
+                self.w[idx] += gradient
+
+    def act(self, game, rng):
+        """
+        Sample a move from the rollout policy.
+
+        Uses exactly one rng.random() call.
+        Passes if no sensible moves remain.
+        """
+
+        moves = game.sensible_moves()
+
+        if not moves:
+            return game.pass_move
+
+        probabilities = self.probs(game, moves)
+
+        u = rng.random()
+        cumulative = 0.0
+
+        for p, probability in zip(moves, probabilities):
+
+            cumulative += probability
+
+            if cumulative > u:
+                return p
+
+        # Floating-point rounding fallback.
+        return moves[-1]
+
