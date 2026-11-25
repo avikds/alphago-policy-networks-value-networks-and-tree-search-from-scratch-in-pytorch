@@ -1584,3 +1584,133 @@ class ValueNet(nn.Module):
         # Remove the final singleton dimension to return (B,).
         return x.squeeze(-1)
 
+# Step 12 - Node
+class Node:
+    """
+    A Go search-tree node containing separate value-network
+    and rollout statistics for every candidate move.
+
+    Each edge stores:
+        P     : Prior probability from the SL policy.
+        Nv    : Number of value-network visits.
+        Nr    : Number of rollout visits.
+        Wv    : Accumulated value-network outcomes.
+        Wr    : Accumulated rollout outcomes.
+        child : Child search-tree node.
+    """
+
+    def __init__(self, game, priors):
+        # Store the Go position represented by this node.
+        self.game = game
+
+        # Initialize edges in the original prior order.
+        # Python dictionaries preserve insertion order.
+        self.edges = {
+            a: {
+                "P": float(p),
+                "Nv": 0,
+                "Nr": 0,
+                "Wv": 0.0,
+                "Wr": 0.0,
+                "child": None
+            }
+            for a, p in priors.items()
+        }
+
+    def q(self, a, lam):
+        """
+        Calculate the combined action value of edge a.
+
+        Q(a) = (1 - lam) * Wv / Nv
+               + lam * Wr / Nr
+
+        A component with zero visits contributes zero.
+
+        Args:
+            a: Candidate move.
+            lam: Weight assigned to rollout statistics.
+
+        Returns:
+            Combined action value as a Python float.
+        """
+
+        edge = self.edges[a]
+
+        # Value-network contribution.
+        value_term = (
+            edge["Wv"] / edge["Nv"]
+            if edge["Nv"] > 0
+            else 0.0
+        )
+
+        # Rollout contribution.
+        rollout_term = (
+            edge["Wr"] / edge["Nr"]
+            if edge["Nr"] > 0
+            else 0.0
+        )
+
+        # Combine both evaluation sources.
+        return (
+            (1.0 - lam) * value_term
+            + lam * rollout_term
+        )
+
+    def select(self, c_puct, lam):
+        """
+        Select the move with the highest PUCT score.
+
+        PUCT(a) = Q(a) + U(a)
+
+        U(a) = c_puct * P(a) * sqrt(total) / (1 + Nr(a))
+
+        where total is the sum of rollout visit counts
+        across all edges.
+
+        In case of a tie, the first edge in insertion order
+        is selected.
+
+        Args:
+            c_puct: Exploration constant.
+            lam: Value/rollout mixing coefficient.
+
+        Returns:
+            Selected move.
+        """
+
+        # Total number of rollout visits at this node.
+        total = sum(
+            edge["Nr"]
+            for edge in self.edges.values()
+        )
+
+        # Exploration scale.
+        sqrt_total = math.sqrt(total)
+
+        best_move = None
+        best_score = float("-inf")
+
+        # Evaluate edges in their original prior order.
+        for a, edge in self.edges.items():
+
+            # Combined value-network and rollout estimate.
+            q_value = self.q(a, lam)
+
+            # PUCT exploration bonus.
+            bonus = (
+                c_puct
+                * edge["P"]
+                * sqrt_total
+                / (1 + edge["Nr"])
+            )
+
+            score = q_value + bonus
+
+            # Strict comparison preserves the first move
+            # whenever multiple moves have equal scores.
+            if score > best_score:
+                best_score = score
+                best_move = a
+
+        return best_move
+
