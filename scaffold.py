@@ -230,6 +230,8 @@ class GoGame:
         sym = ".XO"
         return "\n".join(" ".join(sym[self.board[r * self.n + c]] for c in range(self.n)) for r in range(self.n))
 
+import model
+model.GoGame = GoGame
 
 def expert_move(game, rng, noise=0.5):
     """The project's stand-in for a KGS dan player: a fixed Go player written in code.
