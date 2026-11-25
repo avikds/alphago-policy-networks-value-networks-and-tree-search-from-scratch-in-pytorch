@@ -16,6 +16,7 @@ python scaffold.py
 - [x] **4.** PolicyNet
 - [x] **5.** sl_step
 - [x] **6.** RolloutPolicy
+- [x] **7.** sample_moves
 
 ---
 

@@ -759,3 +759,103 @@ class RolloutPolicy:
         # Floating-point rounding fallback.
         return moves[-1]
 
+# Step 7 - sample_moves
+def sample_moves(net, games, generator):
+    """
+    Sample one sensible move for each game using a single batched
+    policy-network forward pass.
+
+    Args:
+        net: PolicyNet model.
+        games: List of unfinished GoGame instances.
+        generator: torch.Generator used for reproducible sampling.
+
+    Returns:
+        moves: Python list containing one integer move per game.
+        x: Float32 feature tensor of shape (B, 46, n, n).
+        mask: Boolean tensor of shape (B, n*n).
+    """
+
+    # Handle an empty batch.
+    if not games:
+        return (
+            [],
+            torch.empty((0, 46, 0, 0), dtype=torch.float32),
+            torch.empty((0, 0), dtype=torch.bool)
+        )
+
+    # ---------------------------------------------------------
+    # 1. Extract feature planes and sensible-move masks.
+    # ---------------------------------------------------------
+
+    feature_batches = []
+    masks = []
+
+    for game in games:
+
+        # Extract the 46 input feature planes.
+        planes = feature_planes(game, value=False)
+
+        feature_batches.append(planes)
+
+        # Plane 44 indicates sensible moves:
+        # legal empty points that do not fill the player's own eye.
+        sensible_mask = planes[44].reshape(-1).bool()
+
+        masks.append(sensible_mask)
+
+    # Stack all games into batched tensors.
+    x = torch.stack(feature_batches, dim=0)
+    mask = torch.stack(masks, dim=0)
+
+    # ---------------------------------------------------------
+    # 2. Initialize every move to pass.
+    # Games without sensible moves retain their pass move.
+    # ---------------------------------------------------------
+
+    moves = [game.pass_move for game in games]
+
+    # Find games that have at least one sensible move.
+    active_indices = torch.nonzero(
+        mask.any(dim=1),
+        as_tuple=False
+    ).flatten()
+
+    # ---------------------------------------------------------
+    # 3. Perform one batched policy-network forward pass.
+    # Only games with available sensible moves are evaluated.
+    # ---------------------------------------------------------
+
+    if active_indices.numel() > 0:
+
+        with torch.no_grad():
+
+            # Compute log-probabilities for all active games
+            # in one forward pass.
+            log_probs = net(
+                x[active_indices],
+                mask[active_indices]
+            )
+
+            # Convert log-probabilities into sampling weights.
+            probabilities = log_probs.exp()
+
+            # -------------------------------------------------
+            # 4. Sample one move independently for each game.
+            # -------------------------------------------------
+
+            sampled_moves = torch.multinomial(
+                probabilities,
+                num_samples=1,
+                generator=generator
+            ).squeeze(1)
+
+        # Store sampled moves as Python integers.
+        for idx, sampled_move in zip(
+            active_indices.tolist(),
+            sampled_moves.tolist()
+        ):
+            moves[idx] = int(sampled_move)
+
+    return moves, x, mask
+
