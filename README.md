@@ -22,6 +22,7 @@ python scaffold.py
 - [x] **10.** value_positions
 - [x] **11.** ValueNet
 - [x] **12.** Node
+- [x] **13.** backup
 
 ---
 

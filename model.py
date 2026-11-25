@@ -1714,3 +1714,72 @@ class Node:
 
         return best_move
 
+# Step 13 - backup
+def add_virtual_loss(path, n_vl):
+    """
+    Apply virtual loss to every edge along a search path.
+
+    For every (node, action) pair:
+        Nr += n_vl
+        Wr -= n_vl
+
+    This temporarily penalizes the selected path during
+    parallel or concurrent tree-search simulations.
+
+    Args:
+        path: List of (node, action) pairs from root to leaf.
+        n_vl: Virtual-loss amount.
+    """
+
+    for node, action in path:
+
+        edge = node.edges[action]
+
+        # Temporarily increase rollout visits and decrease
+        # accumulated rollout value.
+        edge["Nr"] += n_vl
+        edge["Wr"] -= n_vl
+
+
+def backup(path, leaf_player, v, z, n_vl):
+    """
+    Replace virtual loss with actual simulation results.
+
+    The rollout result z and value-network prediction v are
+    converted to the perspective of each node's player to move.
+
+    Args:
+        path: List of (node, action) pairs from root to leaf.
+        leaf_player: Player to move at the leaf position.
+        v: Value-network prediction, or None.
+        z: Rollout result from the leaf player's perspective.
+        n_vl: Previously applied virtual-loss amount.
+    """
+
+    for node, action in path:
+
+        edge = node.edges[action]
+
+        # Determine the perspective of the current node.
+        # Outcomes are positive when the leaf player's perspective
+        # matches the player to move at this node.
+        sign = (
+            1.0
+            if node.game.to_play == leaf_player
+            else -1.0
+        )
+
+        # Remove the temporary virtual visits and replace them
+        # with one completed rollout visit.
+        edge["Nr"] += 1 - n_vl
+
+        # Replace the virtual loss with the actual rollout result.
+        edge["Wr"] += n_vl + sign * z
+
+        # Incorporate the value-network prediction separately.
+        if v is not None:
+
+            edge["Nv"] += 1
+
+            edge["Wv"] += sign * v
+
