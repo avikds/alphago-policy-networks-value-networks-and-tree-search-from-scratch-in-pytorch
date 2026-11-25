@@ -1783,3 +1783,291 @@ def backup(path, leaf_player, v, z, n_vl):
 
             edge["Wv"] += sign * v
 
+# Step 14 - mcts_move
+def priors(sl_net, game, temperature):
+    """
+    Calculate the SL policy's prior probabilities over sensible moves.
+
+    Returns:
+        Dictionary mapping moves to probabilities in increasing
+        move order. Returns {pass_move: 1.0} if no sensible moves exist.
+    """
+
+    # Extract the position's feature planes.
+    planes = feature_planes(game, value=False)
+
+    # Plane 44 identifies sensible moves.
+    sensible = planes[44].reshape(-1).bool()
+
+    # Find sensible moves in increasing board-position order.
+    moves = torch.nonzero(
+        sensible,
+        as_tuple=False
+    ).flatten()
+
+    # If no sensible move exists, return the pass action.
+    if moves.numel() == 0:
+        return {game.pass_move: 1.0}
+
+    # Determine the policy network's device.
+    device = next(sl_net.parameters()).device
+
+    x = planes.unsqueeze(0).to(device)
+    mask = sensible.unsqueeze(0).to(device)
+
+    # Calculate policy log-probabilities without gradients.
+    with torch.no_grad():
+        log_probs = sl_net(x, mask)
+
+        # Apply temperature scaling.
+        scaled_log_probs = (
+            log_probs[0, moves.to(device)] / temperature
+        )
+
+        # Normalize the probabilities over sensible moves.
+        probabilities = torch.softmax(
+            scaled_log_probs,
+            dim=0
+        )
+
+    # Return the probabilities as an ordered Python dictionary.
+    probabilities = probabilities.cpu().tolist()
+
+    return {
+        int(move): float(probability)
+        for move, probability in zip(moves.tolist(), probabilities)
+    }
+
+
+def mcts_move(
+    game,
+    sl_net,
+    value_net,
+    rollout,
+    n_sim,
+    lam,
+    rng,
+    c_puct=1.0,
+    n_vl=3,
+    n_thr=1,
+    temperature=0.67
+):
+    """
+    Execute Monte Carlo Tree Search using PUCT.
+
+    Each simulation performs:
+        1. Selection.
+        2. Virtual loss.
+        3. Leaf evaluation.
+        4. Backup.
+        5. Expansion.
+
+    Supports both PyTorch ValueNet models and ordinary callable
+    value evaluators.
+
+    Returns:
+        move: Most-visited move at the root.
+        root: Root Node containing the search statistics.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Initialize the root node.
+    # ---------------------------------------------------------
+
+    root = Node(
+        game.copy(),
+        priors(sl_net, game, temperature)
+    )
+
+    # Handle an already completed game.
+    if root.game.done:
+        return game.pass_move, root
+
+    # ---------------------------------------------------------
+    # 2. Run MCTS simulations.
+    # ---------------------------------------------------------
+
+    for _ in range(n_sim):
+
+        node = root
+        path = []
+
+        # -----------------------------------------------------
+        # 3. Selection: traverse the existing search tree.
+        # -----------------------------------------------------
+
+        while True:
+
+            action = node.select(c_puct, lam)
+
+            path.append((node, action))
+
+            edge = node.edges[action]
+
+            # Stop at an unexpanded edge.
+            if edge["child"] is None:
+                break
+
+            # Otherwise, continue into the child node.
+            node = edge["child"]
+
+        selected_edge = edge
+
+        # -----------------------------------------------------
+        # 4. Apply virtual loss along the selected path.
+        # -----------------------------------------------------
+
+        add_virtual_loss(path, n_vl)
+
+        # -----------------------------------------------------
+        # 5. Create the leaf position.
+        # -----------------------------------------------------
+
+        leaf = node.game.copy()
+
+        # Play the selected action on the copied position.
+        leaf.play(action)
+
+        # Player to move at the leaf.
+        leaf_player = leaf.to_play
+
+        # -----------------------------------------------------
+        # 6. Evaluate the leaf.
+        # -----------------------------------------------------
+
+        if leaf.done:
+
+            # Terminal position: obtain the actual game outcome.
+            result = (
+                1.0
+                if leaf.winner() == leaf_player
+                else -1.0
+            )
+
+            v = result
+            z = result
+
+        else:
+
+            # -------------------------------------------------
+            # 6A. Value Network evaluation.
+            # -------------------------------------------------
+
+            if lam < 1.0:
+
+                value_features = feature_planes(
+                    leaf,
+                    value=True
+                ).unsqueeze(0)
+
+                # Default to the feature tensor's device.
+                # This supports ordinary callable evaluators
+                # that do not implement parameters().
+                value_device = value_features.device
+
+                # For a PyTorch model, use its parameter device.
+                parameters_fn = getattr(
+                    value_net,
+                    "parameters",
+                    None
+                )
+
+                if callable(parameters_fn):
+                    try:
+                        first_parameter = next(parameters_fn())
+                        value_device = first_parameter.device
+                    except StopIteration:
+                        pass
+
+                value_features = value_features.to(value_device)
+
+                # Evaluate the position without computing gradients.
+                with torch.no_grad():
+
+                    value_prediction = value_net(value_features)
+
+                    v = float(
+                        value_prediction.reshape(-1)[0].item()
+                    )
+
+            else:
+
+                # Value Network is not used when lambda = 1.
+                v = None
+
+            # -------------------------------------------------
+            # 6B. Rollout evaluation.
+            # -------------------------------------------------
+
+            if lam > 0.0:
+
+                # Keep the original leaf position unchanged.
+                rollout_game = leaf.copy()
+
+                # Play until the rollout game finishes.
+                while not rollout_game.done:
+
+                    rollout_move = rollout.act(
+                        rollout_game,
+                        rng
+                    )
+
+                    rollout_game.play(rollout_move)
+
+                # Rollout outcome from the leaf player's perspective.
+                z = (
+                    1.0
+                    if rollout_game.winner() == leaf_player
+                    else -1.0
+                )
+
+            else:
+
+                # No rollout contribution when lambda = 0.
+                z = 0.0
+
+        # -----------------------------------------------------
+        # 7. Back up the evaluation results.
+        # -----------------------------------------------------
+
+        backup(
+            path,
+            leaf_player,
+            v,
+            z,
+            n_vl
+        )
+
+        # -----------------------------------------------------
+        # 8. Expand the selected edge when its visit count
+        #    exceeds n_thr and the leaf is not terminal.
+        # -----------------------------------------------------
+
+        if (
+            selected_edge["child"] is None
+            and selected_edge["Nr"] > n_thr
+            and not leaf.done
+        ):
+
+            selected_edge["child"] = Node(
+                leaf,
+                priors(
+                    sl_net,
+                    leaf,
+                    temperature
+                )
+            )
+
+    # ---------------------------------------------------------
+    # 9. Choose the most-visited action at the root.
+    #
+    # max() preserves dictionary order when visit counts tie.
+    # ---------------------------------------------------------
+
+    move = max(
+        root.edges,
+        key=lambda a: root.edges[a]["Nr"]
+    )
+
+    return move, root
+

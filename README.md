@@ -23,6 +23,7 @@ python scaffold.py
 - [x] **11.** ValueNet
 - [x] **12.** Node
 - [x] **13.** backup
+- [x] **14.** mcts_move
 
 ---
 
