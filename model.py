@@ -859,3 +859,226 @@ def sample_moves(net, games, generator):
 
     return moves, x, mask
 
+# Step 8 - self_play
+def self_play(current, opponent, n_games, generator, n=5, komi=0.5):
+    """
+    Run minibatch self-play games between the current policy
+    network and an earlier opponent policy.
+
+    The current policy plays Black in even-indexed games
+    and White in odd-indexed games.
+
+    Only non-pass moves made by the current policy are recorded.
+
+    Args:
+        current: Current PolicyNet.
+        opponent: Earlier PolicyNet.
+        n_games: Number of self-play games.
+        generator: torch.Generator for reproducible sampling.
+        n: Go board size.
+        komi: Komi used by the Go engine.
+
+    Returns:
+        x: Float32 tensor of shape (M, 46, n, n).
+        mask: Boolean tensor of shape (M, n*n).
+        actions: Int64 tensor of shape (M,).
+        z: Float32 tensor of shape (M,).
+        wins: Number of games won by the current policy.
+    """
+
+    # Handle an empty batch.
+    if n_games <= 0:
+        return (
+            torch.empty((0, 46, n, n), dtype=torch.float32),
+            torch.empty((0, n * n), dtype=torch.bool),
+            torch.empty((0,), dtype=torch.int64),
+            torch.empty((0,), dtype=torch.float32),
+            0
+        )
+
+    # ---------------------------------------------------------
+    # 1. Initialize fresh Go games.
+    # ---------------------------------------------------------
+
+    games = [
+        GoGame(n, komi)
+        for _ in range(n_games)
+    ]
+
+    # Current policy plays Black in even games and White in odd
+    # games. GoGame represents Black as 1 and White as 2.
+    current_colors = [
+        1 if i % 2 == 0 else 2
+        for i in range(n_games)
+    ]
+
+    # Store examples separately for each game to preserve
+    # game order and move order in the final output.
+    game_examples = [
+        [] for _ in range(n_games)
+    ]
+
+    # ---------------------------------------------------------
+    # 2. Play until every game has finished.
+    # ---------------------------------------------------------
+
+    while True:
+
+        # Use the Go engine's actual terminal-state property.
+        unfinished = [
+            i for i, game in enumerate(games)
+            if not game.done
+        ]
+
+        if not unfinished:
+            break
+
+        # -----------------------------------------------------
+        # 3. Find unfinished games where current plays.
+        # -----------------------------------------------------
+
+        current_indices = [
+            i for i in unfinished
+            if games[i].to_play == current_colors[i]
+        ]
+
+        if current_indices:
+
+            current_games = [
+                games[i] for i in current_indices
+            ]
+
+            # One batched sampling call for the current policy.
+            current_moves, x_batch, mask_batch = sample_moves(
+                current,
+                current_games,
+                generator
+            )
+
+            for batch_idx, game_idx in enumerate(current_indices):
+
+                game = games[game_idx]
+                move = current_moves[batch_idx]
+
+                # Record the position, legal mask and move only
+                # when the current policy makes a non-pass move.
+                if move != game.pass_move:
+
+                    game_examples[game_idx].append(
+                        (
+                            x_batch[batch_idx].clone(),
+                            mask_batch[batch_idx].clone(),
+                            move
+                        )
+                    )
+
+                # Play the selected move.
+                game.play(move)
+
+        # -----------------------------------------------------
+        # 4. Recalculate unfinished games where opponent plays.
+        #
+        # This is deliberately done AFTER current's moves,
+        # because some games may have finished during that batch.
+        # -----------------------------------------------------
+
+        unfinished = [
+            i for i, game in enumerate(games)
+            if not game.done
+        ]
+
+        opponent_indices = [
+            i for i in unfinished
+            if games[i].to_play != current_colors[i]
+        ]
+
+        if opponent_indices:
+
+            opponent_games = [
+                games[i] for i in opponent_indices
+            ]
+
+            # One batched sampling call for the opponent policy.
+            opponent_moves, _, _ = sample_moves(
+                opponent,
+                opponent_games,
+                generator
+            )
+
+            for game_idx, move in zip(
+                opponent_indices,
+                opponent_moves
+            ):
+
+                game = games[game_idx]
+
+                # Opponent moves are played but not recorded.
+                game.play(move)
+
+    # ---------------------------------------------------------
+    # 5. Assign final game outcomes.
+    # ---------------------------------------------------------
+
+    wins = 0
+
+    xs = []
+    masks = []
+    actions = []
+    outcomes = []
+
+    for game_idx, game in enumerate(games):
+
+        # Determine the winner of the completed game.
+        winner = game.winner()
+
+        # Compare the winner with the current policy's colour.
+        current_won = (winner == current_colors[game_idx])
+
+        if current_won:
+            wins += 1
+
+        # Outcome is always from the current policy's perspective.
+        z_game = 1.0 if current_won else -1.0
+
+        # Append this game's examples in their original move order.
+        for position, legal_mask, move in game_examples[game_idx]:
+
+            xs.append(position)
+            masks.append(legal_mask)
+            actions.append(move)
+            outcomes.append(z_game)
+
+    # ---------------------------------------------------------
+    # 6. Convert recorded examples into correctly typed tensors.
+    # ---------------------------------------------------------
+
+    if xs:
+
+        x = torch.stack(xs).to(dtype=torch.float32)
+
+        mask = torch.stack(masks).to(dtype=torch.bool)
+
+    else:
+
+        x = torch.empty(
+            (0, 46, n, n),
+            dtype=torch.float32
+        )
+
+        mask = torch.empty(
+            (0, n * n),
+            dtype=torch.bool
+        )
+
+    actions = torch.tensor(
+        actions,
+        dtype=torch.int64
+    )
+
+    z = torch.tensor(
+        outcomes,
+        dtype=torch.float32
+    )
+
+    return x, mask, actions, z, int(wins)
+

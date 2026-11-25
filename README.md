@@ -17,6 +17,7 @@ python scaffold.py
 - [x] **5.** sl_step
 - [x] **6.** RolloutPolicy
 - [x] **7.** sample_moves
+- [x] **8.** self_play
 
 ---
 
