@@ -20,6 +20,7 @@ python scaffold.py
 - [x] **8.** self_play
 - [x] **9.** train_rl_policy
 - [x] **10.** value_positions
+- [x] **11.** ValueNet
 
 ---
 

@@ -1489,3 +1489,98 @@ def value_positions(
 
     return x, z
 
+# Step 11 - ValueNet
+class ValueNet(nn.Module):
+    """
+    AlphaGo Value Network.
+
+    Architecture:
+        - Initial 5x5 convolution.
+        - (layers - 1) intermediate 3x3 convolutions.
+        - Final 1x1 convolution.
+        - Fully connected hidden layer.
+        - Scalar output with tanh activation.
+
+    The output represents the predicted outcome for the
+    player to move, bounded between -1 and 1.
+    """
+
+    def __init__(self, planes=47, k=32, layers=5, n=5, hidden=256):
+        super().__init__()
+
+        self.n = n
+
+        # Store the convolutional layers.
+        self.convs = nn.ModuleList()
+
+        # Initial 5x5 convolution.
+        self.convs.append(
+            nn.Conv2d(
+                in_channels=planes,
+                out_channels=k,
+                kernel_size=5,
+                padding=2
+            )
+        )
+
+        # Add (layers - 1) intermediate 3x3 convolutions.
+        for _ in range(layers - 1):
+            self.convs.append(
+                nn.Conv2d(
+                    in_channels=k,
+                    out_channels=k,
+                    kernel_size=3,
+                    padding=1
+                )
+            )
+
+        # Final 1x1 convolution produces one feature per board point.
+        self.head = nn.Conv2d(
+            in_channels=k,
+            out_channels=1,
+            kernel_size=1
+        )
+
+        # Fully connected hidden layer.
+        self.fc = nn.Linear(
+            n * n,
+            hidden
+        )
+
+        # Final scalar value prediction.
+        self.out = nn.Linear(
+            hidden,
+            1
+        )
+
+    def forward(self, x):
+        """
+        Predict game outcomes for a batch of Go positions.
+
+        Args:
+            x: Float tensor of shape (B, planes, n, n).
+
+        Returns:
+            Tensor of shape (B,), containing predictions
+            between -1 and 1.
+        """
+
+        # Apply convolutional layers with ReLU activations.
+        for conv in self.convs:
+            x = F.relu(conv(x))
+
+        # Apply the final 1x1 convolution without an activation.
+        x = self.head(x)
+
+        # Flatten the spatial dimensions.
+        x = x.flatten(start_dim=1)
+
+        # Fully connected hidden layer with ReLU.
+        x = F.relu(self.fc(x))
+
+        # Predict the final scalar outcome.
+        x = torch.tanh(self.out(x))
+
+        # Remove the final singleton dimension to return (B,).
+        return x.squeeze(-1)
+
