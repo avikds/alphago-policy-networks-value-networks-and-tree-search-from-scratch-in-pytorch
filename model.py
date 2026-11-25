@@ -1215,3 +1215,277 @@ def train_rl_policy(sl_net, iterations, n_games, pool_every, lr, generator):
 
     return net, pool, history
 
+# Step 10 - value_positions
+def value_positions(
+    sl_net,
+    rl_net,
+    n_games,
+    u_max,
+    generator,
+    all_positions=False,
+    n=5,
+    komi=0.5
+):
+    """
+    Generate value-network training examples using three-phase
+    self-play games.
+
+    Phase 1: SL policy plays before the randomly selected move U.
+    Phase 2: A uniformly random legal move is played at U.
+    Phase 3: RL policy plays after move U.
+
+    Args:
+        sl_net: Supervised-learning policy network.
+        rl_net: Reinforcement-learning policy network.
+        n_games: Number of self-play games.
+        u_max: Maximum random transition time step.
+        generator: torch.Generator for reproducible sampling.
+        all_positions: If True, record every position at the
+                       beginning of each round. Otherwise,
+                       record only the position immediately
+                       after the random move.
+        n: Go board size.
+        komi: Komi used by the Go engine.
+
+    Returns:
+        x: Float32 tensor of shape (M, 47, n, n).
+        z: Float32 tensor of shape (M,).
+    """
+
+    # ---------------------------------------------------------
+    # 1. Handle an empty batch.
+    # ---------------------------------------------------------
+
+    if n_games <= 0:
+        return (
+            torch.empty((0, 47, n, n), dtype=torch.float32),
+            torch.empty((0,), dtype=torch.float32)
+        )
+
+    # ---------------------------------------------------------
+    # 2. Initialize fresh games and random transition points.
+    # ---------------------------------------------------------
+
+    games = [
+        GoGame(n, komi)
+        for _ in range(n_games)
+    ]
+
+    # Random transition time for each game.
+    # The selected move itself belongs to the random phase.
+    U = torch.randint(
+        1,
+        u_max + 1,
+        (n_games,),
+        generator=generator
+    ).tolist()
+
+    # Store positions separately for each game.
+    # This preserves game order in the final training dataset.
+    game_positions = [
+        [] for _ in range(n_games)
+    ]
+
+    # ---------------------------------------------------------
+    # 3. Play all games together, one move per unfinished game
+    #    in each round.
+    # ---------------------------------------------------------
+
+    while True:
+
+        # Find games that have not finished.
+        unfinished = [
+            i for i, game in enumerate(games)
+            if not game.done
+        ]
+
+        if not unfinished:
+            break
+
+        # -----------------------------------------------------
+        # 4. Record positions at the beginning of each round
+        #    when all_positions=True.
+        # -----------------------------------------------------
+
+        if all_positions:
+
+            for i in unfinished:
+
+                game = games[i]
+
+                game_positions[i].append(
+                    (
+                        feature_planes(game, value=True),
+                        game.to_play
+                    )
+                )
+
+        # -----------------------------------------------------
+        # 5. Divide unfinished games into SL, RL and random
+        #    transition groups.
+        #
+        # The next move number is game.moves + 1.
+        # -----------------------------------------------------
+
+        sl_indices = []
+        rl_indices = []
+        random_indices = []
+
+        for i in unfinished:
+
+            game = games[i]
+
+            move_number = game.moves + 1
+
+            if move_number < U[i]:
+
+                # Before the random transition: SL policy.
+                sl_indices.append(i)
+
+            elif move_number > U[i]:
+
+                # After the random transition: RL policy.
+                rl_indices.append(i)
+
+            else:
+
+                # The transition move: uniform random policy.
+                random_indices.append(i)
+
+        # -----------------------------------------------------
+        # 6. SL phase: sample moves in one batched forward pass.
+        # -----------------------------------------------------
+
+        if sl_indices:
+
+            sl_games = [
+                games[i] for i in sl_indices
+            ]
+
+            sl_moves, _, _ = sample_moves(
+                sl_net,
+                sl_games,
+                generator
+            )
+
+            for i, move in zip(sl_indices, sl_moves):
+
+                # Play the SL-selected move.
+                games[i].play(move)
+
+        # -----------------------------------------------------
+        # 7. RL phase: sample moves in one batched forward pass.
+        # -----------------------------------------------------
+
+        if rl_indices:
+
+            rl_games = [
+                games[i] for i in rl_indices
+            ]
+
+            rl_moves, _, _ = sample_moves(
+                rl_net,
+                rl_games,
+                generator
+            )
+
+            for i, move in zip(rl_indices, rl_moves):
+
+                # Play the RL-selected move.
+                games[i].play(move)
+
+        # -----------------------------------------------------
+        # 8. Random transition phase.
+        #
+        # Each move is selected uniformly from legal_moves().
+        # If no legal moves exist, the player passes.
+        # -----------------------------------------------------
+
+        for i in random_indices:
+
+            game = games[i]
+
+            legal = game.legal_moves()
+
+            if legal:
+
+                # Select one legal move uniformly at random.
+                random_index = int(
+                    torch.randint(
+                        len(legal),
+                        (1,),
+                        generator=generator
+                    ).item()
+                )
+
+                move = legal[random_index]
+
+            else:
+
+                # Pass when no legal moves are available.
+                move = game.pass_move
+
+            # Play the random transition move.
+            game.play(move)
+
+            # -------------------------------------------------
+            # 9. Record exactly one post-transition position
+            #    when all_positions=False.
+            #
+            # Do not record if the random move ended the game.
+            # -------------------------------------------------
+
+            if not all_positions and not game.done:
+
+                game_positions[i].append(
+                    (
+                        feature_planes(game, value=True),
+                        game.to_play
+                    )
+                )
+
+    # ---------------------------------------------------------
+    # 10. Assign final game outcomes to all recorded positions.
+    # ---------------------------------------------------------
+
+    xs = []
+    outcomes = []
+
+    for i, game in enumerate(games):
+
+        # Determine the winner after the game has finished.
+        winner = game.winner()
+
+        # Each position receives an outcome from the perspective
+        # of the player who was about to move in that position.
+        for position, player in game_positions[i]:
+
+            xs.append(position)
+
+            if player == winner:
+                outcomes.append(1.0)
+            else:
+                outcomes.append(-1.0)
+
+    # ---------------------------------------------------------
+    # 11. Convert the dataset into correctly typed tensors.
+    # ---------------------------------------------------------
+
+    if xs:
+
+        x = torch.stack(xs).to(dtype=torch.float32)
+
+    else:
+
+        x = torch.empty(
+            (0, 47, n, n),
+            dtype=torch.float32
+        )
+
+    z = torch.tensor(
+        outcomes,
+        dtype=torch.float32
+    )
+
+    return x, z
+
