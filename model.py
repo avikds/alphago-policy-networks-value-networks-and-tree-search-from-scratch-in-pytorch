@@ -1082,3 +1082,136 @@ def self_play(current, opponent, n_games, generator, n=5, komi=0.5):
 
     return x, mask, actions, z, int(wins)
 
+# Step 9 - train_rl_policy
+import copy
+
+
+def train_rl_policy(sl_net, iterations, n_games, pool_every, lr, generator):
+    """
+    Train a policy network using REINFORCE self-play against
+    a pool of earlier policy versions.
+
+    Args:
+        sl_net: Supervised-learning PolicyNet.
+        iterations: Number of reinforcement-learning iterations.
+        n_games: Number of self-play games per iteration.
+        pool_every: Add the current policy to the opponent pool
+                    after every pool_every iterations.
+        lr: SGD learning rate.
+        generator: torch.Generator for reproducible sampling.
+
+    Returns:
+        net: Reinforcement-learning policy network.
+        pool: List of historical policy state dictionaries.
+        history: List of current policy win rates.
+    """
+
+    # ---------------------------------------------------------
+    # 1. Initialize the reinforcement-learning network.
+    # ---------------------------------------------------------
+
+    # Start from an independent copy of the supervised network.
+    # The original SL network must remain unchanged.
+    net = copy.deepcopy(sl_net)
+
+    # Optimizer for policy-gradient updates.
+    optimizer = torch.optim.SGD(
+        net.parameters(),
+        lr=lr
+    )
+
+    # ---------------------------------------------------------
+    # 2. Initialize the opponent pool.
+    # ---------------------------------------------------------
+
+    # The initial opponent is a copy of the SL network parameters.
+    pool = [
+        copy.deepcopy(sl_net.state_dict())
+    ]
+
+    # Create a separate opponent network.
+    opponent = copy.deepcopy(sl_net)
+
+    # Store the current policy's win rate at each iteration.
+    history = []
+
+    # ---------------------------------------------------------
+    # 3. Reinforcement-learning iterations.
+    # ---------------------------------------------------------
+
+    for it in range(1, iterations + 1):
+
+        # Randomly select an opponent from the historical pool.
+        k = int(
+            torch.randint(
+                len(pool),
+                (1,),
+                generator=generator
+            ).item()
+        )
+
+        # Load the selected historical parameters into the
+        # separate opponent network.
+        opponent.load_state_dict(pool[k])
+
+        # -----------------------------------------------------
+        # 4. Generate self-play training examples.
+        # -----------------------------------------------------
+
+        x, mask, actions, z, wins = self_play(
+            net,
+            opponent,
+            n_games,
+            generator
+        )
+
+        # -----------------------------------------------------
+        # 5. REINFORCE policy-gradient update.
+        # -----------------------------------------------------
+
+        optimizer.zero_grad()
+
+        # Calculate log-probabilities of the recorded moves.
+        log_probs = net(x, mask)
+
+        # Extract the log-probability assigned to each
+        # action actually selected during self-play.
+        selected_log_probs = log_probs.gather(
+            dim=1,
+            index=actions.unsqueeze(1)
+        ).squeeze(1)
+
+        # REINFORCE objective:
+        # Minimize the negative outcome-weighted log-likelihood.
+        #
+        # Positive outcomes encourage the selected actions.
+        # Negative outcomes discourage the selected actions.
+        loss = -(
+            z * selected_log_probs
+        ).sum() / n_games
+
+        # Backpropagate the policy-gradient loss.
+        loss.backward()
+
+        # Update the reinforcement-learning policy.
+        optimizer.step()
+
+        # -----------------------------------------------------
+        # 6. Record the current policy's win rate.
+        # -----------------------------------------------------
+
+        history.append(wins / n_games)
+
+        # -----------------------------------------------------
+        # 7. Update the historical opponent pool.
+        # -----------------------------------------------------
+
+        if it % pool_every == 0:
+
+            # Save an independent snapshot of the current policy.
+            pool.append(
+                copy.deepcopy(net.state_dict())
+            )
+
+    return net, pool, history
+

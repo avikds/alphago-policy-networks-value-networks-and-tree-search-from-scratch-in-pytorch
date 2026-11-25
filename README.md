@@ -18,6 +18,7 @@ python scaffold.py
 - [x] **6.** RolloutPolicy
 - [x] **7.** sample_moves
 - [x] **8.** self_play
+- [x] **9.** train_rl_policy
 
 ---
 
