@@ -251,3 +251,123 @@ def symmetries(planes, move):
 
     return xs, moves
 
+# Step 3 - expert_positions
+def expert_positions(records, n=5, komi=0.5):
+    """
+    Replay expert Go games and construct supervised training examples.
+
+    Each non-pass move produces one training example containing:
+        - Feature planes of the current position.
+        - Legal move mask.
+        - Move played.
+        - Game outcome from the perspective of the player to move.
+        - Index of the game in records.
+
+    Args:
+        records: List of games, where each game is a list of moves.
+                 Moves are represented as row * n + col, with n * n
+                 representing a pass.
+        n: Go board size.
+        komi: Komi used by the Go engine.
+
+    Returns:
+        x:        Float32 tensor of shape (M, 46, n, n).
+        legal:    Boolean tensor of shape (M, n*n).
+        moves:    Int64 tensor of shape (M,).
+        z:        Float32 tensor of shape (M,).
+        game_ids: Int64 tensor of shape (M,).
+    """
+
+    # Store training examples and their corresponding metadata.
+    xs = []
+    legals = []
+    moves = []
+    outcomes = []
+    game_ids = []
+
+    # Replay each expert game independently.
+    for game_idx, record in enumerate(records):
+
+        # Every game starts from a fresh, empty Go board.
+        game = GoGame(n, komi)
+
+        # Keep track of the player who made each recorded move.
+        # Outcomes can only be assigned after the game finishes.
+        game_players = []
+
+        for move in record:
+
+            move = int(move)
+
+            # Identify pass moves.
+            is_pass = (move == n * n)
+
+            # Record a training example before playing each non-pass move.
+            if not is_pass:
+
+                # Current player to move.
+                player = game.to_play
+
+                # Extract the 46 input feature planes.
+                position = feature_planes(game, value=False)
+
+                xs.append(position)
+
+                # Construct a legal move mask.
+                # A point must be both empty and legal for the current player.
+                legal_mask = torch.tensor(
+                    [
+                        game.board[p] == 0 and game.is_legal(p)
+                        for p in range(n * n)
+                    ],
+                    dtype=torch.bool
+                )
+
+                legals.append(legal_mask)
+
+                # Store the expert's move.
+                moves.append(move)
+
+                # Store the player who made this move.
+                game_players.append(player)
+
+                # Store the index of the source game.
+                game_ids.append(game_idx)
+
+            # Play the move, including passes.
+            # Passes advance the game but do not generate training examples.
+            game.play(move)
+
+        # ---------------------------------------------------------
+        # Assign outcomes after the entire game has been replayed.
+        # ---------------------------------------------------------
+
+        winner = game.winner()
+
+        # Outcome is relative to the player who was to move
+        # when each training position was recorded.
+        for player in game_players:
+            if player == winner:
+                outcomes.append(1.0)
+            else:
+                outcomes.append(-1.0)
+
+    # ---------------------------------------------------------
+    # Convert collected examples into tensors with the required
+    # shapes and data types.
+    # ---------------------------------------------------------
+
+    if xs:
+        x = torch.stack(xs).to(dtype=torch.float32)
+        legal = torch.stack(legals)
+    else:
+        # Handle an empty dataset while preserving the required shapes.
+        x = torch.empty((0, 46, n, n), dtype=torch.float32)
+        legal = torch.empty((0, n * n), dtype=torch.bool)
+
+    moves = torch.tensor(moves, dtype=torch.int64)
+    z = torch.tensor(outcomes, dtype=torch.float32)
+    game_ids = torch.tensor(game_ids, dtype=torch.int64)
+
+    return x, legal, moves, z, game_ids
+
