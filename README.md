@@ -14,6 +14,7 @@ python scaffold.py
 - [x] **2.** symmetries
 - [x] **3.** expert_positions
 - [x] **4.** PolicyNet
+- [x] **5.** sl_step
 
 ---
 

@@ -465,3 +465,45 @@ class PolicyNet(nn.Module):
         # Normalize over legal moves using log-softmax.
         return torch.log_softmax(logits, dim=1)
 
+# Step 5 - sl_step
+def sl_step(net, optimizer, x, legal, moves):
+    """
+    Perform one supervised learning step for the policy network.
+
+    Args:
+        net: Trained or untrained PolicyNet model.
+        optimizer: PyTorch optimizer.
+        x: Feature batch of shape (B, 46, n, n).
+        legal: Boolean legal-move mask of shape (B, n*n).
+        moves: Expert moves of shape (B,), with dtype torch.int64.
+
+    Returns:
+        Python float containing the loss value before the optimizer update.
+    """
+
+    # Clear gradients from the previous optimization step.
+    optimizer.zero_grad()
+
+    # Compute log-probabilities over legal moves.
+    log_probs = net(x, legal)
+
+    # Extract the log-probability assigned to each expert move.
+    expert_log_probs = log_probs.gather(
+        dim=1,
+        index=moves.view(-1, 1)
+    )
+
+    # Negative mean log-likelihood of the expert moves.
+    loss = -expert_log_probs.mean()
+
+    # Preserve the loss value before updating the network.
+    loss_value = loss.item()
+
+    # Backpropagate gradients through the policy network.
+    loss.backward()
+
+    # Update the network parameters.
+    optimizer.step()
+
+    return float(loss_value)
+
